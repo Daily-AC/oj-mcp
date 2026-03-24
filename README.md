@@ -8,8 +8,9 @@
 
 ```bash
 # 只需要 server.py 这一个文件
-curl -O https://raw.githubusercontent.com/your-repo/oj-mcp/main/server.py
-# 或者直接复制 server.py 到你的项目中
+curl -O https://raw.githubusercontent.com/Daily-AC/oj-mcp/master/server.py
+# 或者 clone 整个仓库
+git clone https://github.com/Daily-AC/oj-mcp.git
 ```
 
 ### 2. 安装依赖
