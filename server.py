@@ -106,11 +106,22 @@ class HydroClient:
     # --- 账号管理 ---
 
     async def register(self, uname: str, password: str, mail: str) -> dict:
-        token = await self._get_csrf_token("/register")
+        # Step 1: POST /register to get token URL
         data = {"uname": uname, "password": password, "verifyPassword": password, "mail": mail}
-        if token:
-            data["csrfToken"] = token
-        return await self._post("/register", data=data)
+        r1 = await self._post("/register", data=data)
+        token_url = r1.get("url", "")
+        if not token_url or not token_url.startswith("/register/"):
+            return r1  # error or unexpected response
+
+        # Step 2: POST /register/{token} to complete registration
+        r2 = await self._post(token_url, data={
+            "uname": uname,
+            "password": password,
+            "verifyPassword": password,
+        })
+        if "error" in r2:
+            return r2
+        return {"ok": True, "message": f"Registered as {uname}"}
 
     async def login(self, uname: str, password: str) -> dict:
         token = await self._get_csrf_token("/login")
@@ -263,7 +274,7 @@ class HydroClient:
         return {**result, "warning": f"Timed out after {timeout}s, status may not be final"}
 
     async def my_submissions(self, page: int = 1) -> dict:
-        d = await self._get(self._d("/record"), {"page": page, "uidOrName": "me"})
+        d = await self._get(self._d("/record"), {"page": page})
         if "error" in d:
             return d
         rdocs = d.get("rdocs", [])
@@ -326,7 +337,10 @@ class HydroClient:
         }
 
     async def join_contest(self, tid: str) -> dict:
-        return await self._post(self._d(f"/contest/{tid}/attend"))
+        result = await self._post(self._d(f"/contest/{tid}"), data={"operation": "attend"})
+        if "error" in result:
+            return result
+        return {"ok": True, "message": f"Joined contest {tid}"}
 
     async def contest_problems(self, tid: str) -> dict:
         d = await self._get(self._d(f"/contest/{tid}"))
@@ -347,8 +361,8 @@ class HydroClient:
 
     async def contest_submit(self, tid: str, pid: str, lang: str, code: str) -> dict:
         d = await self._post(
-            self._d(f"/contest/{tid}/p/{pid}/submit"),
-            data={"lang": lang, "code": code},
+            self._d(f"/p/{pid}/submit"),
+            data={"lang": lang, "code": code, "tid": tid},
         )
         if "error" in d:
             return d
@@ -766,9 +780,38 @@ async def _dispatch(name: str, args: dict) -> Any:
             return {"error": f"Unknown tool: {name}"}
 
 
-# --- MCP Server (stdio JSON-RPC) ---
+# --- MCP JSON-RPC handler ---
 
-async def main():
+def make_response(rid, method: str, params: dict | None = None):
+    """Process a JSON-RPC request and return a response dict."""
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0",
+            "id": rid,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "oj-mcp", "version": "2.0.0"},
+            },
+        }
+    elif method == "notifications/initialized":
+        return None  # no response
+    elif method == "tools/list":
+        return {"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}}
+    elif method == "tools/call":
+        return "ASYNC_TOOL_CALL"  # placeholder, handled by caller
+    elif rid is not None:
+        return {
+            "jsonrpc": "2.0",
+            "id": rid,
+            "error": {"code": -32601, "message": f"Method not found: {method}"},
+        }
+    return None
+
+
+# --- stdio transport ---
+
+async def main_stdio():
     reader = asyncio.StreamReader()
     protocol = asyncio.StreamReaderProtocol(reader)
     await asyncio.get_event_loop().connect_read_pipe(lambda: protocol, sys.stdin.buffer)
@@ -795,41 +838,83 @@ async def main():
 
         method = req.get("method", "")
         rid = req.get("id")
+        params = req.get("params", {})
 
-        if method == "initialize":
-            await write({
-                "jsonrpc": "2.0",
-                "id": rid,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "oj-mcp", "version": "2.0.0"},
-                },
-            })
-
-        elif method == "notifications/initialized":
-            pass  # ACK, no response needed
-
-        elif method == "tools/list":
-            await write({"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}})
-
-        elif method == "tools/call":
-            tool_name = req["params"]["name"]
-            tool_args = req["params"].get("arguments", {})
+        resp = make_response(rid, method, params)
+        if resp == "ASYNC_TOOL_CALL":
+            tool_name = params["name"]
+            tool_args = params.get("arguments", {})
             result_text = await handle_tool(tool_name, tool_args)
             await write({
                 "jsonrpc": "2.0",
                 "id": rid,
                 "result": {"content": [{"type": "text", "text": result_text}]},
             })
+        elif resp is not None:
+            await write(resp)
 
-        elif rid is not None:
-            await write({
+
+# --- HTTP (Streamable HTTP) transport ---
+
+async def main_http(port: int = 9821):
+    from aiohttp import web
+
+    # Auto-login
+    uname = os.environ.get("OJ_USER")
+    passwd = os.environ.get("OJ_PASS")
+    if uname and passwd:
+        await client.login(uname, passwd)
+
+    async def handle_mcp(request: web.Request):
+        try:
+            req = await request.json()
+        except Exception:
+            return web.json_response(
+                {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}},
+                status=400,
+            )
+
+        method = req.get("method", "")
+        rid = req.get("id")
+        params = req.get("params", {})
+
+        resp = make_response(rid, method, params)
+        if resp == "ASYNC_TOOL_CALL":
+            tool_name = params["name"]
+            tool_args = params.get("arguments", {})
+            result_text = await handle_tool(tool_name, tool_args)
+            resp = {
                 "jsonrpc": "2.0",
                 "id": rid,
-                "error": {"code": -32601, "message": f"Method not found: {method}"},
-            })
+                "result": {"content": [{"type": "text", "text": result_text}]},
+            }
+
+        if resp is None:
+            return web.Response(status=204)
+        return web.json_response(resp)
+
+    app = web.Application()
+    app.router.add_post("/mcp", handle_mcp)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", port)
+    await site.start()
+    print(f"OJ MCP Server listening on http://127.0.0.1:{port}/mcp", flush=True)
+
+    # Keep running
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if "--http" in sys.argv:
+        port = int(os.environ.get("OJ_MCP_PORT", "9821"))
+        for i, arg in enumerate(sys.argv):
+            if arg == "--port" and i + 1 < len(sys.argv):
+                port = int(sys.argv[i + 1])
+        asyncio.run(main_http(port))
+    else:
+        asyncio.run(main_stdio())
